@@ -87,6 +87,7 @@ interface KannaRunOptions {
   cwd: string;
   provider: string;
   model?: string;
+  resumeSessionId?: string;
   workflowRunId: string;
   workflowName: string;
   nodeId: string;
@@ -99,7 +100,7 @@ const DEFAULT_KANNA_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_KANNA_CHAT_TITLE_TEMPLATE = '{{nodeId}}';
 const OPEN_STATE = 1;
 
-const targetsByRun = new Map<string, RunTarget>();
+const targetsByRun = new Map<string, Promise<RunTarget>>();
 
 function normalizeOptions(
   config: KannaExecutionConfig | undefined
@@ -141,6 +142,12 @@ function renderTemplate(template: string, values: Record<string, string | undefi
 
 function titleFromTemplate(template: string, values: Record<string, string | undefined>): string {
   return renderTemplate(template, values).replace(/\s+/g, ' ').trim() || 'Archon node';
+}
+
+function chatIdFromKannaSessionId(sessionId: string | undefined): string | undefined {
+  if (!sessionId?.startsWith('kanna:')) return undefined;
+  const parts = sessionId.split(':');
+  return parts.length >= 5 ? parts.slice(4).join(':') : undefined;
 }
 
 function entryKey(entry: KannaTranscriptEntry, index: number): string {
@@ -458,13 +465,19 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   };
 
   try {
-    let target = targetsByRun.get(runKey);
-    if (!target) {
-      target = await resolveRunTarget(socket, localPath, config);
-      targetsByRun.set(runKey, target);
+    let targetPromise = targetsByRun.get(runKey);
+    if (!targetPromise) {
+      targetPromise = resolveRunTarget(socket, localPath, config).catch(error => {
+        targetsByRun.delete(runKey);
+        throw error;
+      });
+      targetsByRun.set(runKey, targetPromise);
     }
+    const target = await targetPromise;
 
+    const resumedChatId = chatIdFromKannaSessionId(options.resumeSessionId);
     const chatId =
+      resumedChatId ??
       target.firstChatId ??
       (
         await socket.command<{ chatId: string }>({
@@ -473,8 +486,10 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
           taskId: target.taskId,
         })
       ).chatId;
-    delete target.firstChatId;
-    await socket.command({ type: 'chat.rename', chatId, title: chatTitle });
+    if (!resumedChatId) {
+      delete target.firstChatId;
+      await socket.command({ type: 'chat.rename', chatId, title: chatTitle });
+    }
 
     unsubscribe = await socket.subscribe({ type: 'chat', chatId, recentLimit: 200 }, envelope => {
       if (envelope.type !== 'snapshot' || envelope.snapshot.type !== 'chat') return;

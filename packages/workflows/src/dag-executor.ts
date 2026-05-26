@@ -1945,6 +1945,7 @@ async function executeLoopNode(
             cwd,
             provider: workflowProvider,
             model: workflowModel,
+            resumeSessionId,
             workflowRunId: workflowRun.id,
             workflowName: workflowContext.name,
             nodeId: node.id,
