@@ -82,6 +82,13 @@ interface RunTarget {
   firstChatId?: string;
 }
 
+interface KannaSessionRef {
+  baseUrl: string;
+  projectId: string;
+  taskId: string;
+  chatId: string;
+}
+
 interface KannaRunOptions {
   prompt: string;
   cwd: string;
@@ -145,10 +152,20 @@ function titleFromTemplate(template: string, values: Record<string, string | und
   return renderTemplate(template, values).replace(/\s+/g, ' ').trim() || 'Archon node';
 }
 
-function chatIdFromKannaSessionId(sessionId: string | undefined): string | undefined {
+function parseKannaSessionId(sessionId: string | undefined): KannaSessionRef | undefined {
   if (!sessionId?.startsWith('kanna:')) return undefined;
   const parts = sessionId.split(':');
-  return parts.length >= 5 ? parts.slice(4).join(':') : undefined;
+  if (parts.length < 5) return undefined;
+  try {
+    return {
+      baseUrl: decodeURIComponent(parts[1]),
+      projectId: parts[2],
+      taskId: parts[3],
+      chatId: parts.slice(4).join(':'),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 function entryKey(entry: KannaTranscriptEntry, index: number): string {
@@ -250,8 +267,10 @@ function isChatSnapshot(data: unknown): data is KannaChatSnapshot {
 class KannaSocket {
   private ws?: WebSocket;
   private openPromise?: Promise<void>;
+  private rejectOpen?: (reason: unknown) => void;
   private readonly pending = new Map<string, PendingCommand>();
   private readonly subscriptions = new Map<string, (envelope: KannaServerEnvelope) => void>();
+  private readonly closeListeners = new Set<(error: Error) => void>();
 
   constructor(private readonly url: string) {}
 
@@ -260,6 +279,7 @@ class KannaSocket {
     if (this.openPromise) return this.openPromise;
 
     this.openPromise = new Promise<void>((resolve, reject) => {
+      this.rejectOpen = reject;
       const ws = new WebSocket(this.url);
       this.ws = ws;
       ws.addEventListener('open', () => {
@@ -269,13 +289,14 @@ class KannaSocket {
         this.handleMessage(event.data);
       });
       ws.addEventListener('close', () => {
-        this.rejectPending(new Error('Kanna WebSocket closed'));
+        this.handleClose(new Error('Kanna WebSocket closed'));
       });
       ws.addEventListener('error', () => {
         reject(new Error(`Failed to connect to Kanna at ${this.url}`));
       });
     }).finally(() => {
       this.openPromise = undefined;
+      this.rejectOpen = undefined;
     });
 
     return this.openPromise;
@@ -306,10 +327,17 @@ class KannaSocket {
     };
   }
 
+  onClose(listener: (error: Error) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => {
+      this.closeListeners.delete(listener);
+    };
+  }
+
   close(): void {
     this.ws?.close();
     this.ws = undefined;
-    this.rejectPending(new Error('Kanna WebSocket closed'));
+    this.handleClose(new Error('Kanna WebSocket closed'));
   }
 
   private send(envelope: unknown): void {
@@ -348,25 +376,39 @@ class KannaSocket {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
   }
+
+  private handleClose(error: Error): void {
+    this.rejectOpen?.(error);
+    this.rejectPending(error);
+    for (const listener of this.closeListeners) listener(error);
+  }
 }
 
 async function readLocalProjects(socket: KannaSocket): Promise<KannaLocalProjectsSnapshot> {
   return new Promise<KannaLocalProjectsSnapshot>((resolve, reject) => {
     let unsubscribe: (() => void) | undefined;
     let received = false;
+    const unsubscribeClose = socket.onClose(error => {
+      unsubscribe?.();
+      reject(error);
+    });
     socket
       .subscribe({ type: 'local-projects' }, envelope => {
         if (envelope.type !== 'snapshot' || envelope.snapshot.type !== 'local-projects') return;
         if (!isLocalProjectsSnapshot(envelope.snapshot.data)) return;
         received = true;
         unsubscribe?.();
+        unsubscribeClose?.();
         resolve(envelope.snapshot.data);
       })
       .then(value => {
         unsubscribe = value;
         if (received) unsubscribe();
       })
-      .catch(reject);
+      .catch(error => {
+        unsubscribeClose?.();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
   });
 }
 
@@ -472,6 +514,7 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   };
 
   const abortListener = (): void => {
+    socket.close();
     close();
   };
   activeRunsByKey.set(runKey, (activeRunsByKey.get(runKey) ?? 0) + 1);
@@ -490,7 +533,14 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
     }
     const target = await targetPromise;
 
-    const resumedChatId = chatIdFromKannaSessionId(options.resumeSessionId);
+    const resumedSession = parseKannaSessionId(options.resumeSessionId);
+    const currentTaskId = target.taskId ?? 'unassigned';
+    const resumedChatId =
+      resumedSession?.baseUrl === baseUrl &&
+      resumedSession.projectId === target.projectId &&
+      resumedSession.taskId === currentTaskId
+        ? resumedSession.chatId
+        : undefined;
     const chatId =
       resumedChatId ??
       target.firstChatId ??
