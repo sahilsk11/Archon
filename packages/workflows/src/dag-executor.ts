@@ -19,6 +19,7 @@ import type {
 import type {
   SendQueryOptions,
   NodeConfig,
+  MessageChunk,
   ProviderCapabilities,
   TokenUsage,
 } from '@archon/providers/types';
@@ -50,6 +51,8 @@ import {
   isScriptNode,
   isApprovalContext,
 } from './schemas';
+import type { KannaExecutionConfig } from './schemas';
+import { resolveKannaExecutionOptions, runPromptViaKanna } from './kanna-transport';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -156,6 +159,11 @@ interface WorkflowLevelOptions {
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
+}
+
+interface WorkflowExecutionContext {
+  name: string;
+  kanna?: KannaExecutionConfig;
 }
 
 /** Internal node execution result — extends NodeOutput with cost data for aggregation. */
@@ -586,8 +594,10 @@ async function executeNodeInternal(
   conversationId: string,
   cwd: string,
   workflowRun: WorkflowRun,
+  workflowContext: WorkflowExecutionContext,
   node: CommandNode | PromptNode,
   provider: string,
+  model: string | undefined,
   nodeOptions: SendQueryOptions | undefined,
   artifactsDir: string,
   logDir: string,
@@ -692,7 +702,8 @@ async function executeNodeInternal(
   // Substitute upstream node output references
   const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
-  const aiClient = deps.getAgentProvider(provider);
+  const kannaOptions = resolveKannaExecutionOptions(workflowContext.kanna, node.kanna);
+  const aiClient = kannaOptions ? undefined : deps.getAgentProvider(provider);
   const streamingMode = platform.getStreamingMode();
 
   let nodeOutputText = ''; // Always accumulate regardless of streaming mode
@@ -707,8 +718,9 @@ async function executeNodeInternal(
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
+  const directResumeSessionId = resumeSessionId?.startsWith('kanna:') ? undefined : resumeSessionId;
   // Fork when resuming — leaves the source session untouched so retries are safe.
-  const shouldForkSession = resumeSessionId !== undefined;
+  const shouldForkSession = directResumeSessionId !== undefined;
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
@@ -717,20 +729,34 @@ async function executeNodeInternal(
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+  const directMessageStream = (): AsyncGenerator<MessageChunk> => {
+    if (!aiClient) throw new Error(`Provider '${provider}' was not initialized`);
+    return aiClient.sendQuery(finalPrompt, cwd, directResumeSessionId, nodeOptionsWithAbort);
+  };
+  const messageStream: AsyncGenerator<MessageChunk> = kannaOptions
+    ? runPromptViaKanna({
+        prompt: finalPrompt,
+        cwd,
+        provider,
+        model,
+        resumeSessionId,
+        workflowRunId: workflowRun.id,
+        workflowName: workflowContext.name,
+        nodeId: node.id,
+        config: kannaOptions,
+        abortSignal: nodeAbortController.signal,
+      })
+    : directMessageStream();
 
   try {
-    for await (const msg of withIdleTimeout(
-      aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
-      effectiveIdleTimeout,
-      () => {
-        nodeIdleTimedOut = true;
-        getLog().warn(
-          { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
-          'dag_node_idle_timeout_reached'
-        );
-        nodeAbortController.abort();
-      }
-    )) {
+    for await (const msg of withIdleTimeout(messageStream, effectiveIdleTimeout, () => {
+      nodeIdleTimedOut = true;
+      getLog().warn(
+        { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
+        'dag_node_idle_timeout_reached'
+      );
+      nodeAbortController.abort();
+    })) {
       const tickNow = Date.now();
       const nodeKey = `${workflowRun.id}:${node.id}`;
 
@@ -1196,6 +1222,7 @@ async function executeNodeInternal(
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
+          ...(newSessionId ? { provider_session_id: newSessionId } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1772,6 +1799,7 @@ async function executeLoopNode(
   conversationId: string,
   cwd: string,
   workflowRun: WorkflowRun,
+  workflowContext: WorkflowExecutionContext,
   node: LoopNode,
   workflowProvider: string,
   workflowModel: string | undefined,
@@ -1786,11 +1814,12 @@ async function executeLoopNode(
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const kannaOptions = resolveKannaExecutionOptions(workflowContext.kanna, node.kanna);
 
   // Resolve AI client — fail fast with descriptive error
-  let aiClient: ReturnType<typeof deps.getAgentProvider>;
+  let aiClient: ReturnType<typeof deps.getAgentProvider> | undefined;
   try {
-    aiClient = deps.getAgentProvider(workflowProvider);
+    aiClient = kannaOptions ? undefined : deps.getAgentProvider(workflowProvider);
   } catch (error) {
     const err = error as Error;
     const errorMsg = `Invalid provider '${workflowProvider}' for loop node '${node.id}'. Check workflow YAML or .archon/config.yaml. Original: ${err.message}`;
@@ -1908,7 +1937,24 @@ async function executeLoopNode(
         abortSignal: iterationAbortController.signal,
       };
 
-      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      const directIterationStream = (): AsyncGenerator<MessageChunk> => {
+        if (!aiClient) throw new Error(`Provider '${workflowProvider}' was not initialized`);
+        return aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      };
+      const generator: AsyncGenerator<MessageChunk> = kannaOptions
+        ? runPromptViaKanna({
+            prompt: finalPrompt,
+            cwd,
+            provider: workflowProvider,
+            model: workflowModel,
+            resumeSessionId,
+            workflowRunId: workflowRun.id,
+            workflowName: workflowContext.name,
+            nodeId: node.id,
+            config: kannaOptions,
+            abortSignal: iterationAbortController.signal,
+          })
+        : directIterationStream();
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -2274,6 +2320,7 @@ async function executeLoopNode(
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
+            ...(currentSessionId ? { provider_session_id: currentSessionId } : {}),
           },
         })
         .catch((err: Error) => {
@@ -2382,6 +2429,7 @@ async function executeLoopNode(
 async function executeApprovalNode(
   node: ApprovalNode,
   workflowRun: WorkflowRun,
+  workflowContext: WorkflowExecutionContext,
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
@@ -2477,7 +2525,11 @@ async function executeApprovalNode(
       ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
     };
 
-    const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+    const {
+      provider,
+      model,
+      options: nodeOptions,
+    } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
       workflowModel,
@@ -2495,8 +2547,10 @@ async function executeApprovalNode(
       conversationId,
       cwd,
       workflowRun,
+      workflowContext,
       syntheticNode,
       provider,
+      model,
       nodeOptions,
       artifactsDir,
       logDir,
@@ -2568,7 +2622,11 @@ export async function executeDagWorkflow(
   platform: IWorkflowPlatform,
   conversationId: string,
   cwd: string,
-  workflow: { name: string; nodes: readonly DagNode[] } & WorkflowLevelOptions,
+  workflow: {
+    name: string;
+    nodes: readonly DagNode[];
+    kanna?: KannaExecutionConfig;
+  } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
   workflowModel: string | undefined,
@@ -2590,6 +2648,10 @@ export async function executeDagWorkflow(
     sandbox: workflow.sandbox,
   };
   const layers = buildTopologicalLayers(workflow.nodes);
+  const workflowContext: WorkflowExecutionContext = {
+    name: workflow.name,
+    kanna: workflow.kanna,
+  };
   const nodeOutputs = new Map<string, NodeOutput>();
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
@@ -2871,6 +2933,7 @@ export async function executeDagWorkflow(
               conversationId,
               cwd,
               workflowRun,
+              workflowContext,
               node,
               loopProvider,
               loopModel,
@@ -2891,6 +2954,7 @@ export async function executeDagWorkflow(
             const output = await executeApprovalNode(
               node,
               workflowRun,
+              workflowContext,
               deps,
               platform,
               conversationId,
@@ -2963,7 +3027,11 @@ export async function executeDagWorkflow(
           }
 
           // 4. Resolve per-node provider/model/options
-          const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+          const {
+            provider,
+            model,
+            options: nodeOptions,
+          } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
             workflowModel,
@@ -2996,8 +3064,10 @@ export async function executeDagWorkflow(
               conversationId,
               cwd,
               workflowRun,
+              workflowContext,
               node,
               provider,
+              model,
               nodeOptions,
               artifactsDir,
               logDir,

@@ -43,6 +43,11 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
 } from './dag-executor';
+import {
+  getKannaTransportCacheSizeForTests,
+  resetKannaTransportForTests,
+  runPromptViaKanna,
+} from './kanna-transport';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -601,6 +606,35 @@ nodes:
     expect(wf.nodes).toBeDefined();
     expect(wf.nodes[0].prompt).toBe('Output exactly: hello from A');
     expect(wf.nodes[1].depends_on).toEqual(['step-a']);
+  });
+
+  it('preserves workflow-level Kanna routing config from YAML', async () => {
+    const wfDir = join(testDir, '.archon', 'workflows');
+    await mkdir(wfDir, { recursive: true });
+
+    await writeFile(
+      join(wfDir, 'kanna.yaml'),
+      `
+name: kanna-routing
+description: DAG with Kanna routing
+kanna:
+  baseUrl: http://127.0.0.1:3210
+  chatTitleTemplate: "{{workflowRunId}} {{nodeId}}"
+nodes:
+  - id: step-a
+    prompt: "Output exactly: hello from Kanna"
+`
+    );
+
+    const result = await discoverWorkflows(testDir, { loadDefaults: false });
+    expect(result.errors).toHaveLength(0);
+    expect(result.workflows).toHaveLength(1);
+
+    const wf = result.workflows[0].workflow;
+    expect(wf.kanna).toEqual({
+      baseUrl: 'http://127.0.0.1:3210',
+      chatTitleTemplate: '{{workflowRunId}} {{nodeId}}',
+    });
   });
 
   it('ignores unknown top-level fields when valid nodes: is present', async () => {
@@ -1213,6 +1247,1127 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
     const warning = messages.find(m => m.includes('hooks') && m.includes('codex'));
     expect(warning).toBeDefined();
+  });
+
+  it('routes prompt execution through Kanna when the workflow flag is enabled', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+
+    class FakeKannaWebSocket {
+      static readonly instances: FakeKannaWebSocket[] = [];
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        FakeKannaWebSocket.instances.push(this);
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'Kanna response' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-route-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-route',
+          kanna: { baseUrl: 'http://kanna.test', chatTitleTemplate: '{{workflowName}} {{nodeId}}' },
+          nodes: [{ id: 'review', prompt: 'Do the work' }],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      expect(mockGetAgentProviderDag).not.toHaveBeenCalled();
+      expect(commands).toContainEqual({ type: 'project.open', localPath: testDir });
+      expect(commands).toContainEqual({
+        type: 'chat.create',
+        projectId: 'project-1',
+        taskId: null,
+      });
+      expect(commands).toContainEqual({
+        type: 'chat.send',
+        chatId: 'chat-1',
+        content: 'Do the work',
+        provider: 'codex',
+        model: 'gpt-test',
+        clientTraceId: expect.any(String),
+      });
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completed = eventCalls.find(
+        call =>
+          (call[0] as { event_type?: string; step_name?: string }).event_type ===
+            'node_completed' &&
+          (call[0] as { event_type?: string; step_name?: string }).step_name === 'review'
+      );
+      expect((completed?.[0] as { data?: Record<string, unknown> }).data?.node_output).toBe(
+        'Kanna response'
+      );
+      expect(
+        String((completed?.[0] as { data?: Record<string, unknown> }).data?.provider_session_id)
+      ).toContain('kanna:http%3A%2F%2Fkanna.test:project-1:unassigned:chat-1');
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('unblocks and cleans up Kanna transport when an abort happens while snapshots are silent', async () => {
+    resetKannaTransportForTests();
+    const originalWebSocket = globalThis.WebSocket;
+
+    class SilentKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string };
+        };
+        if (envelope.type !== 'command' || !envelope.command) return;
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      SilentKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const controller = new AbortController();
+      const chunks: unknown[] = [];
+      const consume = (async () => {
+        for await (const chunk of runPromptViaKanna({
+          prompt: 'Do the work',
+          cwd: testDir,
+          provider: 'codex',
+          model: 'gpt-test',
+          workflowRunId: 'abort-kanna-run',
+          workflowName: 'abort-kanna-workflow',
+          nodeId: 'review',
+          config: { baseUrl: 'http://kanna.test' },
+          abortSignal: controller.signal,
+        })) {
+          chunks.push(chunk);
+        }
+      })();
+
+      await new Promise(resolve => setTimeout(resolve, 0));
+      controller.abort();
+
+      await expect(
+        Promise.race([
+          consume.then(() => 'completed'),
+          new Promise(resolve => setTimeout(() => resolve('timeout'), 100)),
+        ])
+      ).resolves.toBe('completed');
+      expect(chunks).toContainEqual(
+        expect.objectContaining({
+          type: 'result',
+          sessionId: 'kanna:http%3A%2F%2Fkanna.test:project-1:unassigned:chat-1',
+        })
+      );
+      expect(getKannaTransportCacheSizeForTests()).toBe(0);
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('cleans up Kanna transport when aborted during task resolution setup', async () => {
+    resetKannaTransportForTests();
+    const originalWebSocket = globalThis.WebSocket;
+
+    class SilentTaskKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          topic?: { type: string };
+        };
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'local-projects') return;
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      SilentTaskKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const controller = new AbortController();
+      const consume = (async () => {
+        for await (const _chunk of runPromptViaKanna({
+          prompt: 'Do the work',
+          cwd: testDir,
+          provider: 'codex',
+          model: 'gpt-test',
+          workflowRunId: 'abort-task-kanna-run',
+          workflowName: 'abort-task-kanna-workflow',
+          nodeId: 'review',
+          config: { baseUrl: 'http://kanna.test', taskName: 'Missing Task' },
+          abortSignal: controller.signal,
+        })) {
+          // no-op
+        }
+      })();
+
+      await new Promise(resolve => setTimeout(resolve, 0));
+      controller.abort();
+
+      await expect(
+        Promise.race([
+          consume.then(
+            () => 'completed',
+            () => 'rejected'
+          ),
+          new Promise(resolve => setTimeout(() => resolve('timeout'), 100)),
+        ])
+      ).resolves.toBe('rejected');
+      expect(getKannaTransportCacheSizeForTests()).toBe(0);
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('does not throw when Kanna unsubscribe runs after the socket already closed', async () => {
+    resetKannaTransportForTests();
+    const originalWebSocket = globalThis.WebSocket;
+
+    class ClosingKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string };
+          topic?: { type: string };
+        };
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'done' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+            this.emit('close');
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      ClosingKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const chunks = [];
+      for await (const chunk of runPromptViaKanna({
+        prompt: 'Do the work',
+        cwd: testDir,
+        provider: 'codex',
+        model: 'gpt-test',
+        workflowRunId: 'closing-kanna-run',
+        workflowName: 'closing-kanna-workflow',
+        nodeId: 'review',
+        config: { baseUrl: 'http://kanna.test' },
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks).toContainEqual(expect.objectContaining({ type: 'result' }));
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('creates a named Kanna task when taskName is configured and missing', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'local-projects') {
+          this.emit('message', {
+            data: JSON.stringify({
+              v: 1,
+              type: 'snapshot',
+              id: envelope.id,
+              snapshot: { type: 'local-projects', data: { tasks: [] } },
+            }),
+          });
+          return;
+        }
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'task.create'
+            ? { taskId: 'task-1', projectId: 'project-1', chatId: 'chat-1' }
+            : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'Named task response' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-task-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-task-route',
+          kanna: { baseUrl: 'http://kanna.test', taskName: 'Named Task' },
+          nodes: [{ id: 'review', prompt: 'Do task work' }],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(commands).toContainEqual({
+        type: 'task.create',
+        localPath: testDir,
+        title: 'Named Task',
+      });
+      expect(commands).not.toContainEqual({
+        type: 'chat.create',
+        projectId: 'project-1',
+        taskId: 'task-1',
+      });
+      expect(commands).toContainEqual({ type: 'chat.rename', chatId: 'chat-1', title: 'review' });
+      expect(commands).toContainEqual({
+        type: 'chat.send',
+        chatId: 'chat-1',
+        content: 'Do task work',
+        provider: 'codex',
+        model: 'gpt-test',
+        clientTraceId: expect.any(String),
+      });
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('threads sequential Kanna prompt nodes through a prior chat and ignores stale terminal history', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+    let sendCount = 0;
+    let subscriptionCount = 0;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; chatId?: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          subscriptionCount += 1;
+          if (subscriptionCount > 1) {
+            setTimeout(() => {
+              this.emit('message', {
+                data: JSON.stringify({
+                  v: 1,
+                  type: 'snapshot',
+                  id: envelope.id,
+                  snapshot: {
+                    type: 'chat',
+                    data: {
+                      runtime: { status: 'idle' },
+                      messages: [
+                        { kind: 'assistant_text', id: 'a1', text: 'First response' },
+                        { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                      ],
+                    },
+                  },
+                }),
+              });
+            }, 0);
+          }
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          sendCount += 1;
+          const messages =
+            sendCount === 1
+              ? [
+                  { kind: 'assistant_text', id: 'a1', text: 'First response' },
+                  { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                ]
+              : [
+                  { kind: 'assistant_text', id: 'a1', text: 'First response' },
+                  { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                  { kind: 'assistant_text', id: 'a2', text: 'Second response' },
+                  { kind: 'result', id: 'r2', subtype: 'success', isError: false },
+                ];
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages,
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-shared-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-shared-route',
+          kanna: { baseUrl: 'http://kanna.test' },
+          nodes: [
+            { id: 'first', prompt: 'First prompt' },
+            { id: 'second', depends_on: ['first'], prompt: 'Second prompt' },
+          ],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'chat.create')
+      ).toHaveLength(1);
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'chat.send')
+      ).toEqual([
+        expect.objectContaining({ type: 'chat.send', chatId: 'chat-1', content: 'First prompt' }),
+        expect.objectContaining({ type: 'chat.send', chatId: 'chat-1', content: 'Second prompt' }),
+      ]);
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedSecond = eventCalls.find(
+        call =>
+          (call[0] as { event_type?: string; step_name?: string }).event_type ===
+            'node_completed' &&
+          (call[0] as { event_type?: string; step_name?: string }).step_name === 'second'
+      );
+      expect((completedSecond?.[0] as { data?: Record<string, unknown> }).data?.node_output).toBe(
+        'Second response'
+      );
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('starts a new Kanna chat when a sequential node changes Kanna baseUrl', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+    let chatCreateCount = 0;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; chatId?: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push({ url: this.url, ...envelope.command });
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: this.url.includes('kanna-a') ? 'project-a' : 'project-b' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: `chat-${String(++chatCreateCount)}` }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          const chatId = envelope.command.chatId;
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: `a-${chatId}`, text: `Response ${chatId}` },
+                      { kind: 'result', id: `r-${chatId}`, subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-base-switch-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-base-switch',
+          kanna: { baseUrl: 'http://kanna-a.test' },
+          nodes: [
+            { id: 'first', prompt: 'First prompt' },
+            {
+              id: 'second',
+              depends_on: ['first'],
+              kanna: { baseUrl: 'http://kanna-b.test' },
+              prompt: 'Second prompt',
+            },
+          ],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'chat.create')
+      ).toEqual([
+        expect.objectContaining({ url: 'ws://kanna-a.test/ws', projectId: 'project-a' }),
+        expect.objectContaining({ url: 'ws://kanna-b.test/ws', projectId: 'project-b' }),
+      ]);
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'chat.send')
+      ).toEqual([
+        expect.objectContaining({ url: 'ws://kanna-a.test/ws', chatId: 'chat-1' }),
+        expect.objectContaining({ url: 'ws://kanna-b.test/ws', chatId: 'chat-2' }),
+      ]);
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('drops Kanna session ids when a later sequential node opts out of Kanna routing', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'Kanna first response' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'Direct second response' };
+        yield { type: 'result', sessionId: 'direct-session-1' };
+      });
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-to-direct-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-to-direct',
+          kanna: { baseUrl: 'http://kanna.test' },
+          nodes: [
+            { id: 'first', prompt: 'First prompt' },
+            { id: 'second', depends_on: ['first'], kanna: false, prompt: 'Second prompt' },
+          ],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(commands).toContainEqual({
+        type: 'chat.send',
+        chatId: 'chat-1',
+        content: 'First prompt',
+        provider: 'codex',
+        model: 'gpt-test',
+        clientTraceId: expect.any(String),
+      });
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+      expect(mockSendQueryDag.mock.calls[0][0]).toBe('Second prompt');
+      expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+      expect(mockSendQueryDag.mock.calls[0][3]).not.toHaveProperty('forkSession');
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('creates a named Kanna task only once for parallel nodes in a workflow run', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+    let chatCreateCount = 1;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; chatId?: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'local-projects') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: envelope.id,
+                snapshot: { type: 'local-projects', data: { tasks: [] } },
+              }),
+            });
+          }, 0);
+          return;
+        }
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'task.create'
+            ? { taskId: 'task-1', projectId: 'project-1', chatId: 'chat-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: `chat-${String(++chatCreateCount)}` }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          const chatId = envelope.command.chatId;
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: `a-${chatId}`, text: `Response ${chatId}` },
+                      { kind: 'result', id: `r-${chatId}`, subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-parallel-task-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-parallel-task-route',
+          kanna: { baseUrl: 'http://kanna.test', taskName: 'Parallel Task' },
+          nodes: [
+            { id: 'first', prompt: 'First parallel prompt' },
+            { id: 'second', prompt: 'Second parallel prompt' },
+          ],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'task.create')
+      ).toHaveLength(1);
+      expect(
+        commands.filter(command => (command as { type?: string }).type === 'chat.send')
+      ).toHaveLength(2);
+      expect(commands).toContainEqual({
+        type: 'chat.create',
+        projectId: 'project-1',
+        taskId: 'task-1',
+      });
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
   });
 });
 
@@ -3634,6 +4789,175 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       );
 
       expect(mockSendQueryDag.mock.calls.length).toBe(3);
+    });
+
+    it('threads Kanna loop iterations through the prior chat when context is reused', async () => {
+      resetKannaTransportForTests();
+      const commands: unknown[] = [];
+      const originalWebSocket = globalThis.WebSocket;
+      let sendCount = 0;
+      let subscriptionCount = 0;
+
+      class FakeKannaWebSocket {
+        readonly readyState = 1;
+        private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+        private chatSubscriptionId: string | undefined;
+
+        constructor(readonly url: string) {
+          setTimeout(() => this.emit('open'), 0);
+        }
+
+        addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+          const listeners = this.listeners.get(type) ?? [];
+          listeners.push(listener);
+          this.listeners.set(type, listeners);
+        }
+
+        send(raw: string): void {
+          const envelope = JSON.parse(raw) as {
+            id: string;
+            type: 'command' | 'subscribe' | 'unsubscribe';
+            command?: { type: string; chatId?: string; [key: string]: unknown };
+            topic?: { type: string; chatId?: string };
+          };
+
+          if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+            this.chatSubscriptionId = envelope.id;
+            subscriptionCount += 1;
+            if (subscriptionCount > 1) {
+              setTimeout(() => {
+                this.emit('message', {
+                  data: JSON.stringify({
+                    v: 1,
+                    type: 'snapshot',
+                    id: envelope.id,
+                    snapshot: {
+                      type: 'chat',
+                      data: {
+                        runtime: { status: 'idle' },
+                        messages: [
+                          {
+                            kind: 'assistant_text',
+                            id: 'a-1',
+                            text: 'Iteration one still working',
+                          },
+                          { kind: 'result', id: 'r-1', subtype: 'success', isError: false },
+                        ],
+                      },
+                    },
+                  }),
+                });
+              }, 0);
+            }
+            return;
+          }
+          if (envelope.type !== 'command' || !envelope.command) return;
+
+          commands.push(envelope.command);
+          const result =
+            envelope.command.type === 'project.open'
+              ? { projectId: 'project-1' }
+              : envelope.command.type === 'chat.create'
+                ? { chatId: 'chat-1' }
+                : {};
+          this.emit('message', {
+            data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+          });
+
+          if (envelope.command.type === 'chat.send') {
+            sendCount += 1;
+            const assistantText =
+              sendCount === 1 ? 'Iteration one still working' : 'Done <promise>COMPLETE</promise>';
+            setTimeout(() => {
+              this.emit('message', {
+                data: JSON.stringify({
+                  v: 1,
+                  type: 'snapshot',
+                  id: this.chatSubscriptionId,
+                  snapshot: {
+                    type: 'chat',
+                    data: {
+                      runtime: { status: 'idle' },
+                      messages: [
+                        {
+                          kind: 'assistant_text',
+                          id: `a-${String(sendCount)}`,
+                          text: assistantText,
+                        },
+                        {
+                          kind: 'result',
+                          id: `r-${String(sendCount)}`,
+                          subtype: 'success',
+                          isError: false,
+                        },
+                      ],
+                    },
+                  },
+                }),
+              });
+            }, 0);
+          }
+        }
+
+        close(): void {
+          this.emit('close');
+        }
+
+        private emit(type: string, event?: { data?: string }): void {
+          for (const listener of this.listeners.get(type) ?? []) listener(event);
+        }
+      }
+
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+        FakeKannaWebSocket as unknown as typeof WebSocket;
+
+      try {
+        const mockDeps = createMockDeps();
+        const platform = createMockPlatform();
+        const workflowRun = makeWorkflowRun('kanna-loop-run');
+
+        await executeDagWorkflow(
+          mockDeps,
+          platform,
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-kanna-loop',
+            kanna: { baseUrl: 'http://kanna.test' },
+            nodes: [
+              {
+                id: 'my-loop',
+                loop: {
+                  prompt: 'Do next task.',
+                  until: 'COMPLETE',
+                  max_iterations: 3,
+                },
+              },
+            ],
+          },
+          workflowRun,
+          'codex',
+          'gpt-test',
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          { ...minimalConfig, assistant: 'codex' }
+        );
+
+        expect(
+          commands.filter(command => (command as { type?: string }).type === 'chat.create')
+        ).toHaveLength(1);
+        expect(
+          commands.filter(command => (command as { type?: string }).type === 'chat.send')
+        ).toEqual([
+          expect.objectContaining({ type: 'chat.send', chatId: 'chat-1' }),
+          expect.objectContaining({ type: 'chat.send', chatId: 'chat-1' }),
+        ]);
+      } finally {
+        (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+        resetKannaTransportForTests();
+      }
     });
 
     it('substitutes $LOOP_PREV_OUTPUT with previous iteration output (empty on iter 1)', async () => {

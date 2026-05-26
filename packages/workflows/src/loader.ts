@@ -13,6 +13,7 @@ import {
 } from './schemas/dag-node';
 import { modelReasoningEffortSchema, webSearchModeSchema } from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
+import { kannaExecutionSchema } from './schemas/kanna';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -359,6 +360,12 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
     }
 
+    const kannaResult = kannaExecutionSchema.safeParse(raw.kanna);
+    const kanna = kannaResult.success ? kannaResult.data : undefined;
+    if (raw.kanna !== undefined && !kannaResult.success) {
+      getLog().warn({ filename, value: raw.kanna }, 'invalid_kanna_block_ignored');
+    }
+
     // Warn if any interactive loop node exists in a non-interactive workflow
     // (approval messages won't reach the user in web background runs)
     if (!interactive) {
@@ -434,6 +441,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         webSearchMode,
         additionalDirectories,
         interactive,
+        kanna,
         ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),

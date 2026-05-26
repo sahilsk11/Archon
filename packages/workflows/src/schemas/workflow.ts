@@ -9,6 +9,7 @@ import {
   thinkingConfigSchema,
   sandboxSettingsSchema,
 } from './dag-node';
+import { kannaExecutionSchema } from './kanna';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
@@ -67,6 +68,7 @@ export const workflowBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  kanna: kannaExecutionSchema.optional(),
   worktree: workflowWorktreePolicySchema.optional(),
   /**
    * When `false`, the engine skips the path-exclusive lock for this workflow,
