@@ -43,6 +43,7 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
 } from './dag-executor';
+import { resetKannaTransportForTests } from './kanna-transport';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -601,6 +602,35 @@ nodes:
     expect(wf.nodes).toBeDefined();
     expect(wf.nodes[0].prompt).toBe('Output exactly: hello from A');
     expect(wf.nodes[1].depends_on).toEqual(['step-a']);
+  });
+
+  it('preserves workflow-level Kanna routing config from YAML', async () => {
+    const wfDir = join(testDir, '.archon', 'workflows');
+    await mkdir(wfDir, { recursive: true });
+
+    await writeFile(
+      join(wfDir, 'kanna.yaml'),
+      `
+name: kanna-routing
+description: DAG with Kanna routing
+kanna:
+  baseUrl: http://127.0.0.1:3210
+  chatTitleTemplate: "{{workflowRunId}} {{nodeId}}"
+nodes:
+  - id: step-a
+    prompt: "Output exactly: hello from Kanna"
+`
+    );
+
+    const result = await discoverWorkflows(testDir, { loadDefaults: false });
+    expect(result.errors).toHaveLength(0);
+    expect(result.workflows).toHaveLength(1);
+
+    const wf = result.workflows[0].workflow;
+    expect(wf.kanna).toEqual({
+      baseUrl: 'http://127.0.0.1:3210',
+      chatTitleTemplate: '{{workflowRunId}} {{nodeId}}',
+    });
   });
 
   it('ignores unknown top-level fields when valid nodes: is present', async () => {
@@ -1213,6 +1243,150 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
     const warning = messages.find(m => m.includes('hooks') && m.includes('codex'));
     expect(warning).toBeDefined();
+  });
+
+  it('routes prompt execution through Kanna when the workflow flag is enabled', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+
+    class FakeKannaWebSocket {
+      static readonly instances: FakeKannaWebSocket[] = [];
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        FakeKannaWebSocket.instances.push(this);
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'Kanna response' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-route-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-route',
+          kanna: { baseUrl: 'http://kanna.test', chatTitleTemplate: '{{workflowName}} {{nodeId}}' },
+          nodes: [{ id: 'review', prompt: 'Do the work' }],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      expect(mockGetAgentProviderDag).not.toHaveBeenCalled();
+      expect(commands).toContainEqual({ type: 'project.open', localPath: testDir });
+      expect(commands).toContainEqual({
+        type: 'chat.create',
+        projectId: 'project-1',
+        taskId: null,
+      });
+      expect(commands).toContainEqual({
+        type: 'chat.send',
+        chatId: 'chat-1',
+        content: 'Do the work',
+        provider: 'codex',
+        model: 'gpt-test',
+        clientTraceId: expect.any(String),
+      });
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completed = eventCalls.find(
+        call =>
+          (call[0] as { event_type?: string; step_name?: string }).event_type ===
+            'node_completed' &&
+          (call[0] as { event_type?: string; step_name?: string }).step_name === 'review'
+      );
+      expect((completed?.[0] as { data?: Record<string, unknown> }).data?.node_output).toBe(
+        'Kanna response'
+      );
+      expect(
+        String((completed?.[0] as { data?: Record<string, unknown> }).data?.provider_session_id)
+      ).toContain('kanna:http%3A%2F%2Fkanna.test:project-1:unassigned:chat-1');
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
   });
 });
 

@@ -14,6 +14,7 @@ import { z } from '@hono/zod-openapi';
 import { stepRetryConfigSchema } from './retry';
 import { loopNodeConfigSchema } from './loop';
 import { workflowNodeHooksSchema } from './hooks';
+import { kannaExecutionSchema } from './kanna';
 import { isValidCommandName } from '../command-validation';
 
 // ---------------------------------------------------------------------------
@@ -164,6 +165,7 @@ export const dagNodeBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  kanna: kannaExecutionSchema.optional(),
   // Opt out of resume caching: when true, this node re-runs on resume even if a
   // prior run completed it successfully. Use for producers whose exit code does
   // not capture output validity (e.g. bash that writes a file the consumer parses).

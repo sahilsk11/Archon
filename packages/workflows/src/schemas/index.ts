@@ -16,6 +16,10 @@ export type { StepRetryConfig } from './retry';
 export { loopNodeConfigSchema } from './loop';
 export type { LoopNodeConfig } from './loop';
 
+// Kanna execution routing
+export { kannaExecutionOptionsSchema, kannaExecutionSchema } from './kanna';
+export type { KannaExecutionOptions, KannaExecutionConfig } from './kanna';
+
 // Hooks
 export {
   workflowHookEventSchema,
