@@ -441,6 +441,7 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   const seen = new Set<string>();
   let lastStatus: KannaStatus | undefined;
   let terminal: Partial<MessageChunk & { type: 'result' }> = {};
+  let sentPrompt = false;
   const queue: MessageChunk[] = [];
   let done = false;
   let resolveNext: (() => void) | undefined;
@@ -491,25 +492,53 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
       await socket.command({ type: 'chat.rename', chatId, title: chatTitle });
     }
 
+    let resolveBaseline: (() => void) | undefined;
+    let baselineComplete = !resumedChatId;
+    const baselinePromise = baselineComplete
+      ? Promise.resolve()
+      : new Promise<void>(resolve => {
+          resolveBaseline = resolve;
+        });
+
     unsubscribe = await socket.subscribe({ type: 'chat', chatId, recentLimit: 200 }, envelope => {
       if (envelope.type !== 'snapshot' || envelope.snapshot.type !== 'chat') return;
-      if (!isChatSnapshot(envelope.snapshot.data)) return;
+      if (!isChatSnapshot(envelope.snapshot.data)) {
+        if (!baselineComplete) {
+          baselineComplete = true;
+          resolveBaseline?.();
+          resolveBaseline = undefined;
+        }
+        return;
+      }
       const snapshot = envelope.snapshot.data;
+      if (!baselineComplete) {
+        snapshot.messages.forEach((entry, index) => {
+          seen.add(entryKey(entry, index));
+        });
+        baselineComplete = true;
+        resolveBaseline?.();
+        resolveBaseline = undefined;
+        return;
+      }
       if (snapshot.runtime.status !== lastStatus) {
         push({ type: 'system', content: `Kanna status: ${snapshot.runtime.status}` });
         lastStatus = snapshot.runtime.status;
       }
+      const newEntries: KannaTranscriptEntry[] = [];
       snapshot.messages.forEach((entry, index) => {
         const key = entryKey(entry, index);
         if (seen.has(key)) return;
         seen.add(key);
+        if (!sentPrompt) return;
+        newEntries.push(entry);
         for (const chunk of mapEntry(entry)) push(chunk);
       });
-      terminal = terminalState(snapshot.messages);
+      terminal = terminalState(newEntries);
       if (terminal.stopReason || terminal.isError || snapshot.runtime.status === 'failed') close();
     });
 
-    await socket.command({
+    await baselinePromise;
+    const sendPromise = socket.command({
       type: 'chat.send',
       chatId,
       content: options.prompt,
@@ -517,6 +546,8 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
       model: options.model,
       clientTraceId: crypto.randomUUID(),
     });
+    sentPrompt = true;
+    await sendPromise;
 
     timeout = setTimeout(() => {
       push({

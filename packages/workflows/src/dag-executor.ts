@@ -738,6 +738,7 @@ async function executeNodeInternal(
         cwd,
         provider,
         model,
+        resumeSessionId,
         workflowRunId: workflowRun.id,
         workflowName: workflowContext.name,
         nodeId: node.id,
