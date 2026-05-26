@@ -300,7 +300,9 @@ class KannaSocket {
     this.send({ v: 1, type: 'subscribe', id, topic });
     return () => {
       this.subscriptions.delete(id);
-      this.send({ v: 1, type: 'unsubscribe', id });
+      if (this.ws?.readyState === OPEN_STATE) {
+        this.send({ v: 1, type: 'unsubscribe', id });
+      }
     };
   }
 

@@ -718,8 +718,9 @@ async function executeNodeInternal(
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
+  const directResumeSessionId = resumeSessionId?.startsWith('kanna:') ? undefined : resumeSessionId;
   // Fork when resuming — leaves the source session untouched so retries are safe.
-  const shouldForkSession = resumeSessionId !== undefined;
+  const shouldForkSession = directResumeSessionId !== undefined;
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
@@ -730,7 +731,7 @@ async function executeNodeInternal(
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
   const directMessageStream = (): AsyncGenerator<MessageChunk> => {
     if (!aiClient) throw new Error(`Provider '${provider}' was not initialized`);
-    return aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort);
+    return aiClient.sendQuery(finalPrompt, cwd, directResumeSessionId, nodeOptionsWithAbort);
   };
   const messageStream: AsyncGenerator<MessageChunk> = kannaOptions
     ? runPromptViaKanna({
