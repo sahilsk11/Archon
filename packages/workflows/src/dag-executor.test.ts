@@ -43,7 +43,11 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
 } from './dag-executor';
-import { resetKannaTransportForTests } from './kanna-transport';
+import {
+  getKannaTransportCacheSizeForTests,
+  resetKannaTransportForTests,
+  runPromptViaKanna,
+} from './kanna-transport';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -1383,6 +1387,95 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       expect(
         String((completed?.[0] as { data?: Record<string, unknown> }).data?.provider_session_id)
       ).toContain('kanna:http%3A%2F%2Fkanna.test:project-1:unassigned:chat-1');
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
+
+  it('unblocks and cleans up Kanna transport when an abort happens while snapshots are silent', async () => {
+    resetKannaTransportForTests();
+    const originalWebSocket = globalThis.WebSocket;
+
+    class SilentKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string };
+        };
+        if (envelope.type !== 'command' || !envelope.command) return;
+        const result =
+          envelope.command.type === 'project.open'
+            ? { projectId: 'project-1' }
+            : envelope.command.type === 'chat.create'
+              ? { chatId: 'chat-1' }
+              : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      SilentKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const controller = new AbortController();
+      const chunks: unknown[] = [];
+      const consume = (async () => {
+        for await (const chunk of runPromptViaKanna({
+          prompt: 'Do the work',
+          cwd: testDir,
+          provider: 'codex',
+          model: 'gpt-test',
+          workflowRunId: 'abort-kanna-run',
+          workflowName: 'abort-kanna-workflow',
+          nodeId: 'review',
+          config: { baseUrl: 'http://kanna.test' },
+          abortSignal: controller.signal,
+        })) {
+          chunks.push(chunk);
+        }
+      })();
+
+      await new Promise(resolve => setTimeout(resolve, 0));
+      controller.abort();
+
+      await expect(
+        Promise.race([
+          consume.then(() => 'completed'),
+          new Promise(resolve => setTimeout(() => resolve('timeout'), 100)),
+        ])
+      ).resolves.toBe('completed');
+      expect(chunks).toContainEqual(
+        expect.objectContaining({
+          type: 'result',
+          sessionId: 'kanna:http%3A%2F%2Fkanna.test:project-1:unassigned:chat-1',
+        })
+      );
+      expect(getKannaTransportCacheSizeForTests()).toBe(0);
     } finally {
       (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
       resetKannaTransportForTests();

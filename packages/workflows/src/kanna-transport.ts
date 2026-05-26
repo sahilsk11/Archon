@@ -101,6 +101,7 @@ const DEFAULT_KANNA_CHAT_TITLE_TEMPLATE = '{{nodeId}}';
 const OPEN_STATE = 1;
 
 const targetsByRun = new Map<string, Promise<RunTarget>>();
+const activeRunsByKey = new Map<string, number>();
 
 function normalizeOptions(
   config: KannaExecutionConfig | undefined
@@ -438,6 +439,7 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   const socket = new KannaSocket(toWebSocketUrl(baseUrl));
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let unsubscribe: (() => void) | undefined;
+  let resolveBaseline: (() => void) | undefined;
   const seen = new Set<string>();
   let lastStatus: KannaStatus | undefined;
   let terminal: Partial<MessageChunk & { type: 'result' }> = {};
@@ -453,6 +455,8 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   };
   const close = (): void => {
     done = true;
+    resolveBaseline?.();
+    resolveBaseline = undefined;
     resolveNext?.();
     resolveNext = undefined;
   };
@@ -465,7 +469,15 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
     return queue.shift();
   };
 
+  const abortListener = (): void => {
+    close();
+  };
+  activeRunsByKey.set(runKey, (activeRunsByKey.get(runKey) ?? 0) + 1);
+  options.abortSignal?.addEventListener('abort', abortListener, { once: true });
+
   try {
+    if (options.abortSignal?.aborted) close();
+
     let targetPromise = targetsByRun.get(runKey);
     if (!targetPromise) {
       targetPromise = resolveRunTarget(socket, localPath, config).catch(error => {
@@ -492,7 +504,6 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
       await socket.command({ type: 'chat.rename', chatId, title: chatTitle });
     }
 
-    let resolveBaseline: (() => void) | undefined;
     let baselineComplete = !resumedChatId;
     const baselinePromise = baselineComplete
       ? Promise.resolve()
@@ -576,11 +587,24 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
     };
   } finally {
     if (timeout) clearTimeout(timeout);
+    options.abortSignal?.removeEventListener('abort', abortListener);
     unsubscribe?.();
     socket.close();
+    const activeRuns = (activeRunsByKey.get(runKey) ?? 1) - 1;
+    if (activeRuns <= 0) {
+      activeRunsByKey.delete(runKey);
+      targetsByRun.delete(runKey);
+    } else {
+      activeRunsByKey.set(runKey, activeRuns);
+    }
   }
 }
 
 export function resetKannaTransportForTests(): void {
   targetsByRun.clear();
+  activeRunsByKey.clear();
+}
+
+export function getKannaTransportCacheSizeForTests(): number {
+  return targetsByRun.size;
 }
