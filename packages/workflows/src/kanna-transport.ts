@@ -10,6 +10,7 @@ type KannaSubscriptionTopic =
 
 type KannaClientCommand =
   | { type: 'project.open'; localPath: string }
+  | { type: 'task.create'; localPath: string; title: string }
   | { type: 'chat.create'; projectId: string; taskId?: string | null }
   | { type: 'chat.rename'; chatId: string; title: string }
   | {
@@ -78,6 +79,7 @@ interface PendingCommand {
 interface RunTarget {
   projectId: string;
   taskId: string | null;
+  firstChatId?: string;
 }
 
 interface KannaRunOptions {
@@ -358,21 +360,50 @@ async function readLocalProjects(socket: KannaSocket): Promise<KannaLocalProject
   });
 }
 
-async function resolveTaskId(
+async function resolveRunTarget(
   socket: KannaSocket,
   localPath: string,
   config: KannaExecutionOptions
-): Promise<string | null> {
-  if (config.taskId?.trim()) return config.taskId.trim();
-  if (!config.taskName?.trim()) return null;
+): Promise<RunTarget> {
+  if (config.taskId?.trim()) {
+    const project = await socket.command<{ projectId: string }>({
+      type: 'project.open',
+      localPath,
+    });
+    return { projectId: project.projectId, taskId: config.taskId.trim() };
+  }
+
+  if (!config.taskName?.trim()) {
+    const project = await socket.command<{ projectId: string }>({
+      type: 'project.open',
+      localPath,
+    });
+    return { projectId: project.projectId, taskId: null };
+  }
 
   const taskName = config.taskName.trim();
   const snapshot = await readLocalProjects(socket);
   const matches = snapshot.tasks.filter(task => task.title === taskName);
   const samePath = matches.find(task => task.localPath === localPath);
   const task = samePath ?? matches[0];
-  if (!task) throw new Error(`Kanna task '${taskName}' was not found`);
-  return task.id;
+  if (task) {
+    const project = await socket.command<{ projectId: string }>({
+      type: 'project.open',
+      localPath,
+    });
+    return { projectId: project.projectId, taskId: task.id };
+  }
+
+  const created = await socket.command<RunTarget & { chatId: string }>({
+    type: 'task.create',
+    localPath,
+    title: taskName,
+  });
+  return {
+    projectId: created.projectId,
+    taskId: created.taskId,
+    firstChatId: created.chatId,
+  };
 }
 
 function providerForKanna(provider: string): KannaProvider | undefined {
@@ -429,49 +460,43 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
   try {
     let target = targetsByRun.get(runKey);
     if (!target) {
-      const project = await socket.command<{ projectId: string }>({
-        type: 'project.open',
-        localPath,
-      });
-      target = {
-        projectId: project.projectId,
-        taskId: await resolveTaskId(socket, localPath, config),
-      };
+      target = await resolveRunTarget(socket, localPath, config);
       targetsByRun.set(runKey, target);
     }
 
-    const chat = await socket.command<{ chatId: string }>({
-      type: 'chat.create',
-      projectId: target.projectId,
-      taskId: target.taskId,
-    });
-    await socket.command({ type: 'chat.rename', chatId: chat.chatId, title: chatTitle });
+    const chatId =
+      target.firstChatId ??
+      (
+        await socket.command<{ chatId: string }>({
+          type: 'chat.create',
+          projectId: target.projectId,
+          taskId: target.taskId,
+        })
+      ).chatId;
+    delete target.firstChatId;
+    await socket.command({ type: 'chat.rename', chatId, title: chatTitle });
 
-    unsubscribe = await socket.subscribe(
-      { type: 'chat', chatId: chat.chatId, recentLimit: 200 },
-      envelope => {
-        if (envelope.type !== 'snapshot' || envelope.snapshot.type !== 'chat') return;
-        if (!isChatSnapshot(envelope.snapshot.data)) return;
-        const snapshot = envelope.snapshot.data;
-        if (snapshot.runtime.status !== lastStatus) {
-          push({ type: 'system', content: `Kanna status: ${snapshot.runtime.status}` });
-          lastStatus = snapshot.runtime.status;
-        }
-        snapshot.messages.forEach((entry, index) => {
-          const key = entryKey(entry, index);
-          if (seen.has(key)) return;
-          seen.add(key);
-          for (const chunk of mapEntry(entry)) push(chunk);
-        });
-        terminal = terminalState(snapshot.messages);
-        if (terminal.stopReason || terminal.isError || snapshot.runtime.status === 'failed')
-          close();
+    unsubscribe = await socket.subscribe({ type: 'chat', chatId, recentLimit: 200 }, envelope => {
+      if (envelope.type !== 'snapshot' || envelope.snapshot.type !== 'chat') return;
+      if (!isChatSnapshot(envelope.snapshot.data)) return;
+      const snapshot = envelope.snapshot.data;
+      if (snapshot.runtime.status !== lastStatus) {
+        push({ type: 'system', content: `Kanna status: ${snapshot.runtime.status}` });
+        lastStatus = snapshot.runtime.status;
       }
-    );
+      snapshot.messages.forEach((entry, index) => {
+        const key = entryKey(entry, index);
+        if (seen.has(key)) return;
+        seen.add(key);
+        for (const chunk of mapEntry(entry)) push(chunk);
+      });
+      terminal = terminalState(snapshot.messages);
+      if (terminal.stopReason || terminal.isError || snapshot.runtime.status === 'failed') close();
+    });
 
     await socket.command({
       type: 'chat.send',
-      chatId: chat.chatId,
+      chatId,
       content: options.prompt,
       provider: providerForKanna(options.provider),
       model: options.model,
@@ -500,7 +525,7 @@ export async function* runPromptViaKanna(options: KannaRunOptions): AsyncGenerat
 
     yield {
       type: 'result',
-      sessionId: `kanna:${encodeURIComponent(baseUrl)}:${target.projectId}:${target.taskId ?? 'unassigned'}:${chat.chatId}`,
+      sessionId: `kanna:${encodeURIComponent(baseUrl)}:${target.projectId}:${target.taskId ?? 'unassigned'}:${chatId}`,
       ...terminal,
     };
   } finally {

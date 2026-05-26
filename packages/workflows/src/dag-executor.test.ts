@@ -1388,6 +1388,146 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       resetKannaTransportForTests();
     }
   });
+
+  it('creates a named Kanna task when taskName is configured and missing', async () => {
+    resetKannaTransportForTests();
+    const commands: unknown[] = [];
+    const originalWebSocket = globalThis.WebSocket;
+
+    class FakeKannaWebSocket {
+      readonly readyState = 1;
+      private readonly listeners = new Map<string, ((event?: { data?: string }) => void)[]>();
+      private chatSubscriptionId: string | undefined;
+
+      constructor(readonly url: string) {
+        setTimeout(() => this.emit('open'), 0);
+      }
+
+      addEventListener(type: string, listener: (event?: { data?: string }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(raw: string): void {
+        const envelope = JSON.parse(raw) as {
+          id: string;
+          type: 'command' | 'subscribe' | 'unsubscribe';
+          command?: { type: string; [key: string]: unknown };
+          topic?: { type: string; chatId?: string };
+        };
+
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'local-projects') {
+          this.emit('message', {
+            data: JSON.stringify({
+              v: 1,
+              type: 'snapshot',
+              id: envelope.id,
+              snapshot: { type: 'local-projects', data: { tasks: [] } },
+            }),
+          });
+          return;
+        }
+        if (envelope.type === 'subscribe' && envelope.topic?.type === 'chat') {
+          this.chatSubscriptionId = envelope.id;
+          return;
+        }
+        if (envelope.type !== 'command' || !envelope.command) return;
+
+        commands.push(envelope.command);
+        const result =
+          envelope.command.type === 'task.create'
+            ? { taskId: 'task-1', projectId: 'project-1', chatId: 'chat-1' }
+            : {};
+        this.emit('message', {
+          data: JSON.stringify({ v: 1, type: 'ack', id: envelope.id, result }),
+        });
+
+        if (envelope.command.type === 'chat.send') {
+          setTimeout(() => {
+            this.emit('message', {
+              data: JSON.stringify({
+                v: 1,
+                type: 'snapshot',
+                id: this.chatSubscriptionId,
+                snapshot: {
+                  type: 'chat',
+                  data: {
+                    runtime: { status: 'idle' },
+                    messages: [
+                      { kind: 'assistant_text', id: 'a1', text: 'Named task response' },
+                      { kind: 'result', id: 'r1', subtype: 'success', isError: false },
+                    ],
+                  },
+                },
+              }),
+            });
+          }, 0);
+        }
+      }
+
+      close(): void {
+        this.emit('close');
+      }
+
+      private emit(type: string, event?: { data?: string }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
+      FakeKannaWebSocket as unknown as typeof WebSocket;
+
+    try {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('kanna-task-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-kanna-task-route',
+          kanna: { baseUrl: 'http://kanna.test', taskName: 'Named Task' },
+          nodes: [{ id: 'review', prompt: 'Do task work' }],
+        },
+        workflowRun,
+        'codex',
+        'gpt-test',
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'codex' }
+      );
+
+      expect(commands).toContainEqual({
+        type: 'task.create',
+        localPath: testDir,
+        title: 'Named Task',
+      });
+      expect(commands).not.toContainEqual({
+        type: 'chat.create',
+        projectId: 'project-1',
+        taskId: 'task-1',
+      });
+      expect(commands).toContainEqual({ type: 'chat.rename', chatId: 'chat-1', title: 'review' });
+      expect(commands).toContainEqual({
+        type: 'chat.send',
+        chatId: 'chat-1',
+        content: 'Do task work',
+        provider: 'codex',
+        model: 'gpt-test',
+        clientTraceId: expect.any(String),
+      });
+    } finally {
+      (globalThis as { WebSocket: typeof WebSocket }).WebSocket = originalWebSocket;
+      resetKannaTransportForTests();
+    }
+  });
 });
 
 describe('executeDagWorkflow -- bash nodes', () => {
