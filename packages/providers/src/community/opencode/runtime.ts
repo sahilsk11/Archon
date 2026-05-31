@@ -70,8 +70,9 @@ export interface EmbeddedRuntime {
   client: OpencodeClientLike;
   server: { url: string; close(): void };
   refCount: number;
+  managed: boolean;
   /** Promise that created this runtime - used to prevent race conditions on release */
-  creationPromise: Promise<EmbeddedRuntime>;
+  creationPromise?: Promise<EmbeddedRuntime>;
 }
 
 let embeddedRuntimePromise: Promise<EmbeddedRuntime> | undefined;
@@ -218,6 +219,7 @@ export async function acquireEmbeddedRuntime(signal?: AbortSignal): Promise<Embe
           client: runtime.client as OpencodeClientLike,
           server: runtime.server,
           refCount: 0,
+          managed: true,
           creationPromise: promise,
         });
       } catch (error) {
@@ -232,7 +234,26 @@ export async function acquireEmbeddedRuntime(signal?: AbortSignal): Promise<Embe
   return runtime;
 }
 
+export async function acquireExternalRuntime(
+  baseUrl: string,
+  signal?: AbortSignal
+): Promise<EmbeddedRuntime> {
+  if (signal?.aborted) {
+    throw new Error('OpenCode runtime startup aborted');
+  }
+
+  const { createOpencodeClient } = await import('@opencode-ai/sdk');
+  return {
+    client: createOpencodeClient({ baseUrl }) as OpencodeClientLike,
+    server: { url: baseUrl, close: () => undefined },
+    refCount: 1,
+    managed: false,
+  };
+}
+
 export function releaseEmbeddedRuntime(runtime: EmbeddedRuntime): void {
+  if (!runtime.managed) return;
+
   runtime.refCount = Math.max(0, runtime.refCount - 1);
   if (runtime.refCount > 0) return;
 
@@ -245,7 +266,7 @@ export function releaseEmbeddedRuntime(runtime: EmbeddedRuntime): void {
     const port = extractPortFromUrl(runtime.server.url);
     if (port) {
       const pid = findProcessByPort(port);
-      if (pid) {
+      if (pid && pid !== process.pid) {
         getLog().debug({ port, pid }, 'opencode.killing_embedded_process');
         killProcess(pid);
       }

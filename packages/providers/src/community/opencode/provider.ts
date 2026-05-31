@@ -17,6 +17,7 @@ import { materializeAgents } from './agent-fs';
 import { streamMultiAgentOpencodeSession } from './multi-agent';
 import {
   acquireEmbeddedRuntime,
+  acquireExternalRuntime,
   disposeInstanceForDirectory,
   releaseEmbeddedRuntime,
 } from './runtime';
@@ -76,18 +77,10 @@ export class OpencodeProvider implements IAgentProvider {
     const orderedAgents = getOrderedAgents(requestOptions?.nodeConfig);
     const hasAgentConfig = orderedAgents.length > 0;
     const isMultiAgent = orderedAgents.length > 1;
-    const usingExternalBaseUrl = Boolean(assistantConfig.baseUrl);
-    if (usingExternalBaseUrl) {
-      throw new Error(
-        'OpenCode external baseUrl mode is no longer supported. ' +
-          'Archon now requires managed embedded OpenCode runtime for fully controlled agent lifecycle.'
-      );
-    }
+    const externalBaseUrl = assistantConfig.baseUrl;
 
     const sessionCwd =
-      hasAgentConfig && nodeId && !usingExternalBaseUrl
-        ? join(cwd, '.archon-opencode', nodeId)
-        : cwd;
+      hasAgentConfig && nodeId && !externalBaseUrl ? join(cwd, '.archon-opencode', nodeId) : cwd;
 
     let lastError: Error | undefined;
     let recoveredAgentNotFound = false;
@@ -101,7 +94,9 @@ export class OpencodeProvider implements IAgentProvider {
         client: import('./runtime').OpencodeClientLike;
         release: () => void;
       }> => {
-        const embedded = await acquireEmbeddedRuntime(requestOptions?.abortSignal);
+        const embedded = externalBaseUrl
+          ? await acquireExternalRuntime(externalBaseUrl, requestOptions?.abortSignal)
+          : await acquireEmbeddedRuntime(requestOptions?.abortSignal);
         return {
           client: embedded.client,
           release: (): void => {
