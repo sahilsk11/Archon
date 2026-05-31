@@ -980,8 +980,11 @@ describe('OpencodeProvider', () => {
     });
   });
 
-  test('external baseUrl mode is rejected to enforce managed runtime control', async () => {
+  test('external baseUrl mode uses an existing OpenCode server client', async () => {
     const cwd = await createTempProjectDir();
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
     const nodeConfig = {
       agents: {
         reviewer: {
@@ -998,13 +1001,16 @@ describe('OpencodeProvider', () => {
       })
     );
 
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
+    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({
+      baseUrl: 'http://remote-opencode.local',
+    });
     expect(mockCreateOpencode).not.toHaveBeenCalled();
+    expect(runtime.server.close).not.toHaveBeenCalled();
   });
 
-  test('external baseUrl mode is rejected even when pre-generated agent files exist', async () => {
+  test('external baseUrl mode materializes agent files before using existing server', async () => {
     const cwd = await createTempProjectDir();
     const agentsDir = join(cwd, '.opencode', 'agents');
     await mkdir(agentsDir, { recursive: true });
@@ -1037,13 +1043,16 @@ describe('OpencodeProvider', () => {
       })
     );
 
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
+    expect(error).toBeUndefined();
     expect(await readFile(join(agentsDir, 'custom-agent.md'), 'utf8')).toBe('# user content\n');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
+    expect(await readFile(join(agentsDir, 'archon-reviewer.md'), 'utf8')).toContain('Review');
+    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({
+      baseUrl: 'http://remote-opencode.local',
+    });
     expect(mockCreateOpencode).not.toHaveBeenCalled();
   });
 
-  test('external baseUrl mode rejection happens before runtime/dispose side effects', async () => {
+  test('external baseUrl mode still refreshes the OpenCode instance cache', async () => {
     const cwd = await createTempProjectDir();
     const agentsDir = join(cwd, '.opencode', 'agents');
     await mkdir(agentsDir, { recursive: true });
@@ -1085,19 +1094,32 @@ describe('OpencodeProvider', () => {
       })
     );
 
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(runtime.client.instance.dispose).not.toHaveBeenCalled();
-    expect(callOrder).toEqual([]);
+    expect(error).toBeUndefined();
+    expect(runtime.client.instance.dispose).toHaveBeenCalledWith({
+      query: { directory: cwd },
+    });
+    expect(callOrder).toEqual(['dispose', 'prompt']);
     expect(mockCreateOpencode).not.toHaveBeenCalled();
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
+    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({
+      baseUrl: 'http://remote-opencode.local',
+    });
   });
 
-  test('external baseUrl mode rejects multi-agent execution with same deprecation error', async () => {
+  test('external baseUrl mode supports multi-agent execution', async () => {
     const cwd = await createTempProjectDir();
     const agentsDir = join(cwd, '.opencode', 'agents');
     await mkdir(agentsDir, { recursive: true });
     await writeFile(join(agentsDir, 'archon-agent-a.md'), '---\nmode: subagent\n---\nA\n', 'utf8');
     await writeFile(join(agentsDir, 'archon-agent-b.md'), '---\nmode: subagent\n---\nB\n', 'utf8');
+    const sessionCreate = mock(async () => ({
+      data: { id: sessionCreate.mock.calls.length === 1 ? 'session-a' : 'session-b' },
+    }));
+    const runtime = makeRuntime({ sessionCreate });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      { type: 'session.idle', properties: { sessionID: 'session-a' } },
+      { type: 'session.idle', properties: { sessionID: 'session-b' } },
+    ];
 
     const nodeConfig = {
       nodeId: 'node-multi-remote',
@@ -1114,9 +1136,17 @@ describe('OpencodeProvider', () => {
       })
     );
 
-    expect(chunks).toEqual([]);
-    expect(error?.message).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([
+      {
+        type: 'assistant',
+        content: '## agent-a\n\n(no output)\n\n---\n\n## agent-b\n\n(no output)',
+      },
+      { type: 'result' },
+    ]);
+    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({
+      baseUrl: 'http://remote-opencode.local',
+    });
     expect(mockCreateOpencode).not.toHaveBeenCalled();
   });
 
