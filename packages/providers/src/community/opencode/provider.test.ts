@@ -516,6 +516,39 @@ describe('OpencodeProvider', () => {
     expect(mockLogger.info).not.toHaveBeenCalledWith(expect.any(Object), 'opencode.retrying_query');
   });
 
+  test('account limit retry status fails loudly without waiting for idle timeout', async () => {
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'session-1',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'weekly usage limit reached',
+            action: {
+              reason: 'account_rate_limit',
+              provider: 'opencode-go',
+            },
+          },
+        },
+      },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+      })
+    );
+
+    expect(chunks).toEqual([]);
+    expect(error?.message).toBe('OpenCode account_limit: weekly usage limit reached');
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
+    expect(mockLogger.info).not.toHaveBeenCalledWith(expect.any(Object), 'opencode.retrying_query');
+  });
+
   test('abort propagates to the OpenCode session and surfaces aborted error', async () => {
     const runtime = makeRuntime({
       subscribe: mock(async () => ({
@@ -1148,6 +1181,63 @@ describe('OpencodeProvider', () => {
       baseUrl: 'http://remote-opencode.local',
     });
     expect(mockCreateOpencode).not.toHaveBeenCalled();
+  });
+
+  test('multi-agent account limit retry status aborts sibling sessions and fails loudly', async () => {
+    const cwd = await createTempProjectDir();
+    const agentsDir = join(cwd, '.opencode', 'agents');
+    await mkdir(agentsDir, { recursive: true });
+    await writeFile(join(agentsDir, 'archon-agent-a.md'), '---\nmode: subagent\n---\nA\n', 'utf8');
+    await writeFile(join(agentsDir, 'archon-agent-b.md'), '---\nmode: subagent\n---\nB\n', 'utf8');
+    const sessionCreate = mock(async () => ({
+      data: { id: sessionCreate.mock.calls.length === 1 ? 'session-a' : 'session-b' },
+    }));
+    const runtime = makeRuntime({ sessionCreate });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'session-b',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'weekly usage limit reached',
+            action: {
+              reason: 'account_rate_limit',
+              provider: 'opencode-go',
+            },
+          },
+        },
+      },
+    ];
+
+    const nodeConfig = {
+      nodeId: 'node-multi-rate-limit',
+      agents: {
+        'agent-a': { description: 'A', prompt: 'A' },
+        'agent-b': { description: 'B', prompt: 'B' },
+      },
+    };
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', cwd, undefined, {
+        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
+        nodeConfig,
+      })
+    );
+
+    expect(chunks).toEqual([]);
+    expect(error?.message).toBe('OpenCode account_limit: [agent-b] weekly usage limit reached');
+    expect(runtime.client.session.abort).toHaveBeenCalledWith({
+      path: { id: 'session-a' },
+      query: { directory: cwd },
+    });
+    expect(runtime.client.session.abort).toHaveBeenCalledWith({
+      path: { id: 'session-b' },
+      query: { directory: cwd },
+    });
+    expect(mockCreateOpencodeClient).toHaveBeenCalledTimes(1);
   });
 
   test('uses node prompt as task when agent is configured', async () => {

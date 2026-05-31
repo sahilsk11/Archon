@@ -8,7 +8,7 @@ import {
   selectSingleAgent,
   type NamedAgentConfig,
 } from './agent-config';
-import { errorMessage } from './errors';
+import { errorMessage, statusError } from './errors';
 import type { OpencodeClientLike } from './runtime';
 import { normalizeTokens } from './tokens';
 
@@ -242,6 +242,13 @@ export async function* streamOpencodeSession(
         const err = new Error(errorMessage(rawError));
         err.cause = rawError;
         throw err;
+      }
+
+      if (event.type === 'session.status') {
+        if (properties.sessionID !== sessionId) continue;
+        const err = statusError(properties.status);
+        if (err) throw err;
+        continue;
       }
 
       if (event.type === 'session.idle') {

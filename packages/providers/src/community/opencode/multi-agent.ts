@@ -2,7 +2,7 @@ import { createLogger } from '@archon/paths';
 
 import type { MessageChunk, SendQueryOptions, TokenUsage } from '../../types';
 import { getOrderedAgents, type NamedAgentConfig } from './agent-config';
-import { errorMessage } from './errors';
+import { errorMessage, statusError } from './errors';
 import type { OpencodeClientLike } from './runtime';
 import {
   abortableStream,
@@ -303,6 +303,21 @@ export async function* streamMultiAgentOpencodeSession(
         const err = new Error(`[${state.agent.key}] ${errorMessage(rawError)}`);
         err.cause = rawError;
         throw err;
+      }
+
+      if (event.type === 'session.status') {
+        const sessionId =
+          typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state) continue;
+        const err = statusError(properties.status);
+        if (!err) continue;
+
+        await abortAll();
+        const scopedError = new Error(`[${state.agent.key}] ${err.message}`);
+        scopedError.name = err.name;
+        scopedError.cause = err.cause;
+        throw scopedError;
       }
 
       if (event.type === 'session.idle') {
