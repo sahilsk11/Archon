@@ -15,7 +15,8 @@ const AGENT_NOT_FOUND_PATTERNS = [
   'no agent named',
 ];
 
-export type RetryableErrorClass =
+export type OpencodeErrorClass =
+  | 'account_limit'
   | 'rate_limit'
   | 'auth'
   | 'crash'
@@ -36,7 +37,25 @@ export function errorMessage(error: unknown): string {
   return String(error);
 }
 
-export function classifyOpencodeError(error: unknown, aborted: boolean): RetryableErrorClass {
+export function statusError(status: unknown): Error | undefined {
+  if (!isRecord(status)) return undefined;
+  if (status.type !== 'retry') return undefined;
+
+  const action = isRecord(status.action) ? status.action : undefined;
+  const reason = typeof action?.reason === 'string' ? action.reason : undefined;
+  if (reason !== 'account_rate_limit') return undefined;
+
+  const message =
+    typeof status.message === 'string' && status.message.length > 0
+      ? status.message
+      : 'OpenCode account rate limit reached';
+  const err = new Error(message);
+  err.name = 'OpenCodeAccountLimitError';
+  err.cause = status;
+  return err;
+}
+
+export function classifyOpencodeError(error: unknown, aborted: boolean): OpencodeErrorClass {
   if (aborted) return 'aborted';
 
   const parts: string[] = [];
@@ -55,6 +74,10 @@ export function classifyOpencodeError(error: unknown, aborted: boolean): Retryab
   }
 
   const combined = parts.join(' ').toLowerCase();
+  if (error instanceof Error && error.name === 'OpenCodeAccountLimitError') {
+    return 'account_limit';
+  }
+  if (combined.includes('account_rate_limit')) return 'account_limit';
   if (RATE_LIMIT_PATTERNS.some(pattern => combined.includes(pattern))) return 'rate_limit';
   if (AUTH_PATTERNS.some(pattern => combined.includes(pattern))) return 'auth';
   if (CRASH_PATTERNS.some(pattern => combined.includes(pattern))) return 'crash';
@@ -63,7 +86,7 @@ export function classifyOpencodeError(error: unknown, aborted: boolean): Retryab
   return 'unknown';
 }
 
-export function enrichOpencodeError(error: unknown, errorClass: RetryableErrorClass): Error {
+export function enrichOpencodeError(error: unknown, errorClass: OpencodeErrorClass): Error {
   if (errorClass === 'aborted') {
     return new Error('OpenCode query aborted');
   }
